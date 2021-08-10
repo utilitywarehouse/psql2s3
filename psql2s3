@@ -1,0 +1,44 @@
+#! /bin/bash
+
+set -o errexit
+
+workdir=/psql2s3
+
+psql_user="${PSQL_USER:-"postgres"}"
+psql_hostname="${PSQL_HOSTNAME:-"localhost"}"
+psql_port="${PSQL_PORT:-"5432"}"
+s3_bucket="${S3_BUCKET:?"ERROR: variable S3_BUCKET must be set"}"
+psql2s3_sleep="${PSQL2S3_SLEEP:-"86400"}"
+psql2s3_metrics_port="${PSQL2S3_METRICS_PORT:-"8080"}"
+
+backup_db() {
+  pg_dumpall --host "${psql_hostname}" --port "${psql_port}" --username "${psql_user}" > dumpfile
+  gzip dumpfile
+  aws s3 cp dumpfile.gz "s3://${s3_bucket}/$(date --utc +'%Y-%m-%dT%H:%M:%SZ')_pg_dumpall.gz"
+  rm dumpfile.gz
+
+  # Write out metrics to a temporary file.
+  cat <<EOF >"${workdir}/metrics.$$"
+# HELP psql2s3_last_successful_run timestamp of the last sucessful run, in seconds since epoch
+# TYPE psql2s3_last_successful_run counter
+psql2s3_last_successful_run $(date --utc +'%s')
+EOF
+
+  # Rename the temporary file atomically.
+  # This avoids the http serving half a file.
+  mv "${workdir}/metrics.$$" \
+    "${workdir}/metrics"
+}
+
+mkdir -p "${workdir}"
+busybox httpd -p "${psql2s3_metrics_port}" -h "${workdir}"
+
+# Sleep until postgres is ready
+while ! psql --list --host "${psql_hostname}" --port "${psql_port}" --username "${psql_user}"; do
+  sleep 10
+done
+
+while true; do
+  backup_db
+  sleep "${psql2s3_sleep}"
+done
